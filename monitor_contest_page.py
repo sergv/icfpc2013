@@ -36,6 +36,7 @@ while True:
         print("got some news!")
         for new in set.difference(news, prev_news):
             print(new)
+        print("-" * 80)
 
     prev_news = news
     time.sleep(SLEEP_TIME)

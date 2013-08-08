@@ -3,6 +3,9 @@
   (import (chibi) (scheme base))
   (export
    %test-export
+   %test-runner-alloc
+   %test-runner-total-count
+   %test-runner-total-count!
    test-begin
    test-end test-assert test-eqv test-eq test-equal
    test-approximate test-assert test-error test-apply test-with-runner

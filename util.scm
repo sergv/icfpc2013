@@ -26,7 +26,8 @@
   )
  (chibi
   (import (srfi 16)))
- (else))
+ (else
+  #f))
 
 (define (format dest format-string . args)
   (define (interpret-format port fmt args)

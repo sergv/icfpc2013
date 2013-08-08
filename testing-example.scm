@@ -3,7 +3,13 @@
 ;; Author: Sergey Vinokurov <serg.foo@gmail.com>
 ;; Created: Thursday,  8 August 2013
 
-(import (testing))
+(cond-expand
+ (chibi
+  (import (testing) (util)))
+ (gambit
+  #f)
+ (else
+  #f))
 
 
 (define (ignore . args)
@@ -40,8 +46,8 @@
         (xpass  (test-runner-xpass-count runner))
         (xfail  (test-runner-xfail-count runner))
         (total (%test-runner-total-count runner)))
-    (assert (and (= 0 xfail) (= 0 xpass))
-            "No unexpected passes/failures shoudl be present")
+    ;; (assert (and (= 0 xfail) (= 0 xpass))
+    ;;         "No unexpected passes/failures should be present")
     (if (= 0 failed)
         (format #t "PASSED ~a TESTS" passed)
         (format #t "FALIED ~a TEST~a"
@@ -67,7 +73,7 @@
           (format #t "FAILED ~a:~a\n~a\n"
                   (maybe source-file (cdr source-file))
                   (maybe source-line (cdr source-line))
-                  (pp-to-string (cdr source-form) :max-expr-width 78))))))
+                  (cdr source-form))))))
 
 
 
@@ -75,7 +81,8 @@
   (test-runner-current (sample-test-runner))
   (test-group
    "group1"
-   (test-assert (= 1 2))))
+   (test-assert (= 2 2))
+   (test-assert (= (+ 1 2) 3))))
 
 
 

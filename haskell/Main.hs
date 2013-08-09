@@ -27,7 +27,9 @@ import Data.Attoparsec.Char8
 import Data.Bits
 import qualified Data.ByteString.Lazy.Char8 as BS
 import qualified Data.ByteString.Char8 as SBS
+import Data.Functor (fmap)
 import Data.HashMap.Strict as HM
+import Data.IORef
 import Data.List (sortBy)
 import Data.Ord (compare)
 import Data.Typeable
@@ -35,19 +37,16 @@ import Data.Text as T
 import Data.Vector as V ((!))
 import Data.Word
 
-import Network.HTTP
-import Network.HTTP.Base
-import Network.Stream
-import Network.URI
+import Network.Curl hiding (curlPost)
 
 import Numeric (showHex, readHex)
 import Text.Printf
 
 import Debug.Trace (trace)
 
-eitherDecode, eitherDecode' :: FromJSON a => BS.ByteString -> Either String a
-eitherDecode input = maybe (Left "decoding failed") Right $ decode input
-eitherDecode' input = maybe (Left "decoding failed") Right $ decode' input
+eitherDecode, eitherDecode' :: (Show a, FromJSON a) => BS.ByteString -> Either String a
+eitherDecode input = maybe (Left $ "decoding failed for " ++ BS.unpack input) Right $ decode input
+eitherDecode' input = maybe (Left $ "decoding failed for " ++ BS.unpack input) Right $ decode' input
 
 ----- Utilities
 
@@ -55,15 +54,43 @@ url = "icfpc2013.cloudapp.net"
 auth = "0136KzBjC6HM0KdaVr1KOsK1nCeYPXRLFD9Gp4pm"
 suffix = "vpsH1H"
 
-make_request :: String -> String -> Request String
-make_request path body =
-    let user_info = ""
-        port      = ":80"
-        fragment  = ""
-        uri_auth  = (Just $ URIAuth user_info url port)
-        uri       = URI "http:" uri_auth path ("?auth=" ++ auth ++ suffix) fragment
-        request   = Request uri POST [] body
-    in trace (printf "request body = %s\n" body) $ request
+curlPost :: URLString -> String -> IO (Int, String)
+curlPost path content = do
+    handle <- initialize
+    responseStore <- (newIORef []) :: IO (IORef [String])
+    let full_url = ("http://" ++ url ++ "/" ++ path ++ "?auth=" ++ auth ++ suffix)
+        body = HttpPost "" Nothing (ContentString content) [] Nothing
+        opts = [ CurlURL full_url
+               , CurlVerbose False
+               , CurlHeader False
+               , CurlNoProgress True
+               , CurlPost True
+               -- , CurlHttpPost [body]
+               , CurlPostFields [content]
+               , CurlWriteFunction $ gatherOutput responseStore
+               , CurlHeaderFunction ignoreOutput
+               , CurlFailOnError True
+               ]
+    mapM_ (setopt handle) opts
+    perform handle
+    code <- {-fmap toCode $-} getResponseCode handle
+    output <- readIORef responseStore
+    return (code, Prelude.foldr (++) [] output)
+
+request :: (Show a, FromJSON a) => URLString -> String -> (Int -> String) -> IO (Either String a)
+request path content err_func = do
+    (code, output) <- Main.curlPost path content
+    if code == 200
+    then return $ eitherDecode' $ BS.pack output
+    else return $ Left $ err_func code
+
+    -- setopt handle CurlURL ("http://" ++ url ++ "/" ++ path ++ "?auth=" ++ auth ++ suffix)
+    -- setopt handle CurlVerbose True
+    -- setopt handle CurlHeader True
+    -- setopt handle CurlNoProgress True
+    -- setopt handle CurlPost True
+    -- setopt handle CurlHttpPost (HttpPost "" Nothing (ContentString content) [] Nothing)
+    -- perform handle
 
 read_hex :: String -> Word64
 read_hex ('0': 'x': rest) = read_hex rest
@@ -74,17 +101,8 @@ args_to_hex args = if Prelude.length args > 256
                    then error $ printf "requested too much arguments to evaluate: <= 256 allowed but %d given" (Prelude.length args)
                    else Prelude.map (\arg -> "0x" ++ showHex arg "") args
 
-onConnectionErr :: ConnError -> Either String a
-onConnectionErr err = Left ("connection error: " ++ show err)
 
 ----- Program
-
--- do_request :: String -> String -> IO String
--- do_request path body = do
---      resp <- simpleHTTP $ make_request path body
---      let onConnectionErr = (\err -> error ("connection error: " ++ show err))
---          onOk = (\(Right response) -> response)
---      return $ either onConnectionErr onOk $ resp
 
 type Id = String
 data Program = Lambda Id Expression
@@ -324,18 +342,14 @@ instance FromJSON Problem where
 ---- Get problems request
 
 get_problems :: IO (Either String [Problem])
-get_problems = do
-    resp <- simpleHTTP $ make_request "/myproblems" ""
-    return $ either onConnectionErr onOk $ resp
+get_problems = request "myproblems" "" analyze_error
     where
-        onOk :: Response String -> (Either String [Problem])
-        onOk (Response (2, 0, 0) _ _ body) = eitherDecode' $ BS.pack body
-        onOk (Response (4, 0, 3) _ _ body) =
-            Left "get_problems failed: server informs: 403 authorization required"
-        onOk (Response (4, 2, 9) _ _ body) =
-            Left "get_problems failed: server informs: 429 try again later"
-        onOk (Response (a, b, c) _ _ body) =
-            Left (printf "get_problems failed: server informs: %d%d%d other error" a b c)
+        analyze_error 403 =
+            "get_problems failed: server informs: 403 authorization required"
+        analyze_error 429 =
+            "get_problems failed: server informs: 429 try again later"
+        analyze_error x =
+            (printf "get_problems failed: server informs: %d other error" x)
 
 
 ----- Evaluation
@@ -408,26 +422,22 @@ instance FromJSON EvalResponse where
             _            -> error $ "invalid status of json eval response" ++ (show v)
 
 eval_request :: EvalRequest -> IO (Either String EvalResponse)
-eval_request request = do
-    resp <- simpleHTTP $ make_request "/eval" (BS.unpack $ encode request)
-    return $ either onConnectionErr onOk $ resp
+eval_request req = request "eval" (BS.unpack $ encode req) analyze_error
     where
-        onOk :: Response String -> (Either String EvalResponse)
-        onOk (Response (2, 0, 0) _ _ body) = eitherDecode' $ BS.pack body
-        onOk (Response (4, 0, 0) _ _ body) =
-            Left "eval_request failed: server informs: 400 bad request, malformed input"
-        onOk (Response (4, 0, 1) _ _ body) =
-            Left "eval_request failed: server informs: 401 problem was not requested by the current user"
-        onOk (Response (4, 0, 4) _ _ body) =
-            Left "eval_request failed: server informs: 404 no such challenge"
-        onOk (Response (4, 1, 0) _ _ body) =
-            Left "eval_request failed: server informs: 410 too late: problem requested more than 5 minutes ago"
-        onOk (Response (4, 1, 2) _ _ body) =
-            Left "eval_request failed: server informs: 412 problem already solved"
-        onOk (Response (4, 1, 3) _ _ body) =
-            Left "eval_request failed: server informs: 413 request too big"
-        onOk (Response (a, b, c) _ _ body) =
-            Left (printf "eval_request failed: server informs: %d%d%d other error" a b c)
+        analyze_error 400 =
+            "eval_request failed: server informs: 400 bad request, malformed input"
+        analyze_error 401 =
+            "eval_request failed: server informs: 401 problem was not requested by the current user"
+        analyze_error 404 =
+            "eval_request failed: server informs: 404 no such challenge"
+        analyze_error 410 =
+            "eval_request failed: server informs: 410 too late: problem requested more than 5 minutes ago"
+        analyze_error 412 =
+            "eval_request failed: server informs: 412 problem already solved"
+        analyze_error 413 =
+            "eval_request failed: server informs: 413 request too big"
+        analyze_error x =
+            (printf "eval_request failed: server informs: %d other error" x)
 
 ----- Guesses
 
@@ -470,26 +480,22 @@ instance FromJSON GuessResponse where
             _               -> error $ "invalid status of json eval response" ++ (show v)
 
 guess_request :: GuessRequest -> IO (Either String GuessResponse)
-guess_request request = do
-    resp <- simpleHTTP $ make_request "/guess" (BS.unpack $ encode request)
-    return $ either onConnectionErr onOk $ resp
+guess_request req = request "guess" (BS.unpack $ encode req) analyze_error
     where
-        onOk :: Response String -> (Either String GuessResponse)
-        onOk (Response (2, 0, 0) _ _ body) = eitherDecode' $ BS.pack body
-        onOk (Response (4, 0, 0) _ _ body) =
-            Left "guess_request failed: server informs: 400 bad request, malformed input"
-        onOk (Response (4, 0, 1) _ _ body) =
-            Left "guess_request failed: server informs: 401 problem was not requested by the current user"
-        onOk (Response (4, 0, 4) _ _ body) =
-            Left "guess_request failed: server informs: 404 no such challenge"
-        onOk (Response (4, 1, 0) _ _ body) =
-            Left "guess_request failed: server informs: 410 too late: problem requested more than 5 minutes ago"
-        onOk (Response (4, 1, 2) _ _ body) =
-            Left "guess_request failed: server informs: 412 problem already solved"
-        onOk (Response (4, 1, 3) _ _ body) =
-            Left "guess_request failed: server informs: 413 request too big"
-        onOk (Response (a, b, c) _ _ body) =
-            Left (printf "guess_request failed: server informs: %d%d%d other error" a b c)
+        analyze_error 400 =
+            "guess_request failed: server informs: 400 bad request, malformed input"
+        analyze_error 401 =
+            "guess_request failed: server informs: 401 problem was not requested by the current user"
+        analyze_error 404 =
+            "guess_request failed: server informs: 404 no such challenge"
+        analyze_error 410 =
+            "guess_request failed: server informs: 410 too late: problem requested more than 5 minutes ago"
+        analyze_error 412 =
+            "guess_request failed: server informs: 412 problem already solved"
+        analyze_error 413 =
+            "guess_request failed: server informs: 413 request too big"
+        analyze_error x =
+            (printf "guess_request failed: server informs: %d other error" x)
 
 ---- Training
 
@@ -531,24 +537,25 @@ instance FromJSON TrainingProblem where
         liftM decodeSexpUnsafe (v .: "challenge") <*>
         (v .: "id") <*>
         (v .: "size") <*>
-        (v .: "operator")
+        (v .: "operators")
 
 training_request :: TrainingRequest -> IO (Either String TrainingProblem)
-training_request request = do
-    resp <- simpleHTTP $ make_request "/train" (BS.unpack $ encode request)
-    return $ either onConnectionErr onOk $ resp
+training_request req = do
+    let r = (BS.unpack $ encode req)
+    printf "r = %s\n" r
+    request "train" r analyze_error
     where
-        onOk :: Response String -> (Either String TrainingProblem)
-        onOk (Response (2, 0, 0) _ _ body) = eitherDecode' $ BS.pack body
-        onOk (Response (4, 0, 0) _ _ body) =
-            Left "guess_request failed: server informs: 400 bad request, malformed input"
-        onOk (Response (4, 0, 3) _ _ body) =
-            Left "guess_request failed: server informs: 403 authorization required"
-        onOk (Response (4, 2, 9) _ _ body) =
-            Left "guess_request failed: server informs: 429 try again later"
-        onOk (Response (a, b, c) _ _ body) =
-            Left (printf "guess_request failed: server informs: %d%d%d other error" a b c)
+        analyze_error 400 =
+            "guess_request failed: server informs: 400 bad request, malformed input"
+        analyze_error 403 =
+            "guess_request failed: server informs: 403 authorization required"
+        analyze_error 429 =
+            "guess_request failed: server informs: 429 try again later"
+        analyze_error x =
+            (printf "guess_request failed: server informs: %d other error" x)
 
 
-
+main :: IO ()
+main = do
+     training_request (TrainingRequest 3 RequestNoOperator) >>= print
 

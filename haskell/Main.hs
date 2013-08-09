@@ -19,7 +19,7 @@
 module Main where
 
 import Control.Applicative (pure, (<$>), (<*>), (<|>))
-import Control.Monad (liftM, mzero, mplus)
+import Control.Monad (liftM, mzero, mplus, mapM_)
 
 import Data.Aeson ((.:), (.:?), (.=), object, encode, decode, decode',
                    FromJSON(..), Value(..), ToJSON(..))
@@ -28,6 +28,8 @@ import Data.Bits
 import qualified Data.ByteString.Lazy.Char8 as BS
 import qualified Data.ByteString.Char8 as SBS
 import Data.HashMap.Strict as HM
+import Data.List (sortBy)
+import Data.Ord (compare)
 import Data.Typeable
 import Data.Text as T
 import Data.Vector as V ((!))
@@ -41,6 +43,7 @@ import Network.URI
 import Numeric (showHex, readHex)
 import Text.Printf
 
+import Debug.Trace (trace)
 
 eitherDecode, eitherDecode' :: FromJSON a => BS.ByteString -> Either String a
 eitherDecode input = maybe (Left "decoding failed") Right $ decode input
@@ -60,14 +63,16 @@ make_request path body =
         uri_auth  = (Just $ URIAuth user_info url port)
         uri       = URI "http:" uri_auth path ("?auth=" ++ auth ++ suffix) fragment
         request   = Request uri POST [] body
-    in request
+    in trace (printf "request body = %s\n" body) $ request
 
 read_hex :: String -> Word64
 read_hex ('0': 'x': rest) = read_hex rest
 read_hex num              = fst $ Prelude.head $ readHex num
 
 args_to_hex :: [Word64] -> [String]
-args_to_hex args = Prelude.map (\arg -> "0x" ++ showHex arg "") args
+args_to_hex args = if Prelude.length args > 256
+                   then error $ printf "requested too much arguments to evaluate: <= 256 allowed but %d given" (Prelude.length args)
+                   else Prelude.map (\arg -> "0x" ++ showHex arg "") args
 
 onConnectionErr :: ConnError -> Either String a
 onConnectionErr err = Left ("connection error: " ++ show err)
@@ -83,18 +88,18 @@ onConnectionErr err = Left ("connection error: " ++ show err)
 
 type Id = String
 data Program = Lambda Id Expression
-             deriving (Show, Eq)
+             deriving (Show, Eq, Read)
 data Expression = Literal Word64
                 | Id Id
                 | If0 Expression Expression Expression
                 | Fold Expression Expression Id Id Expression
                 | Op1 Op1 Expression
                 | Op2 Op2 Expression Expression
-                deriving (Show, Eq)
+                deriving (Show, Eq, Read)
 data Op1 = Not | Shl | Shr | Shr4 | Shr16
-         deriving (Show, Eq)
+         deriving (Show, Eq, Read)
 data Op2 = And | Or | Xor | Plus
-         deriving (Show, Eq)
+         deriving (Show, Eq, Read)
 
 ---- sexp encoding
 
@@ -146,6 +151,13 @@ instance ProgramSexpEncode Expression where
 
 decodeSexp' :: String -> Either String Program
 decodeSexp' = decodeSexp . SBS.pack
+
+decodeSexpUnsafe :: SBS.ByteString -> Program
+decodeSexpUnsafe input =
+    case decodeSexp input of
+        Right prog -> prog
+        Left err -> error $ "decodeSexpUnsafe: error while decoding program: " ++ err
+
 
 decodeSexp :: SBS.ByteString -> Either String Program
 decodeSexp input = parseOnly programParser input
@@ -245,12 +257,13 @@ decodeSexp input = parseOnly programParser input
 ----- Problem
 
 ---- hints, problem datatype
+
 data HintOp = HintOp1 Op1
             | HintOp2 Op2
             | HintIf0
             | HintTFold
             | HintFold
-            deriving (Show, Eq)
+            deriving (Show, Eq, Read)
 
 data Problem = Problem
              { problemId :: String
@@ -259,7 +272,12 @@ data Problem = Problem
              , problemSolved :: Maybe Bool
              , problemTimeLeft :: Maybe Float
              }
-             deriving (Show, Eq)
+             deriving (Show, Eq, Read)
+
+problem_store = "/home/sergey/projects/icfpc/2013_Aug/haskell/problems.store"
+
+load_problems :: IO [Problem]
+load_problems = readFile problem_store >>= return . read
 
 type MayFailStr = Either String String
 
@@ -323,6 +341,7 @@ get_problems = do
 ----- Evaluation
 
 ---- evaluate :: Program -> Word64 -> Word64
+
 evaluate :: Program -> Word64 -> Word64
 evaluate (Lambda var expr) input = eval expr (HM.singleton var input)
 
@@ -452,7 +471,7 @@ instance FromJSON GuessResponse where
 
 guess_request :: GuessRequest -> IO (Either String GuessResponse)
 guess_request request = do
-    resp <- simpleHTTP $ make_request "/eval" (BS.unpack $ encode request)
+    resp <- simpleHTTP $ make_request "/guess" (BS.unpack $ encode request)
     return $ either onConnectionErr onOk $ resp
     where
         onOk :: Response String -> (Either String GuessResponse)
@@ -471,6 +490,65 @@ guess_request request = do
             Left "guess_request failed: server informs: 413 request too big"
         onOk (Response (a, b, c) _ _ body) =
             Left (printf "guess_request failed: server informs: %d%d%d other error" a b c)
+
+---- Training
+
+data TrainingOperator = RequestNoOperator
+                      | RequestFoldOperator
+                      | RequestTFoldOperator
+                      deriving (Eq, Show)
+
+data TrainingRequest = TrainingRequest Int TrainingOperator
+                     deriving (Eq, Show)
+
+instance ToJSON TrainingRequest where
+    toJSON (TrainingRequest size operators) =
+        object ["size" .= size, "operators" .= op]
+        where
+            op :: [String]
+            op = case operators of
+                RequestNoOperator -> []
+                RequestFoldOperator -> ["fold"]
+                RequestTFoldOperator -> ["tfold"]
+
+-- instance FromJSON EvalRequest where
+--     parseJSON (Object v) =
+--         EvalRequest <$> (v .:? "id") <$> (v .:? "program") <$> (v .: "arguments")
+
+
+           -- challenge id size operatros
+data TrainingProblem = TrainingProblem
+                     { trainingChallenge :: Program
+                     , trainingId :: String
+                     , trainingSize :: Int
+                     , trainingOperators :: [HintOp]
+                     }
+                     deriving (Eq, Show)
+
+instance FromJSON TrainingProblem where
+    parseJSON (Object v) =
+        TrainingProblem <$>
+        liftM decodeSexpUnsafe (v .: "challenge") <*>
+        (v .: "id") <*>
+        (v .: "size") <*>
+        (v .: "operator")
+
+training_request :: TrainingRequest -> IO (Either String TrainingProblem)
+training_request request = do
+    resp <- simpleHTTP $ make_request "/train" (BS.unpack $ encode request)
+    return $ either onConnectionErr onOk $ resp
+    where
+        onOk :: Response String -> (Either String TrainingProblem)
+        onOk (Response (2, 0, 0) _ _ body) = eitherDecode' $ BS.pack body
+        onOk (Response (4, 0, 0) _ _ body) =
+            Left "guess_request failed: server informs: 400 bad request, malformed input"
+        onOk (Response (4, 0, 3) _ _ body) =
+            Left "guess_request failed: server informs: 403 authorization required"
+        onOk (Response (4, 2, 9) _ _ body) =
+            Left "guess_request failed: server informs: 429 try again later"
+        onOk (Response (a, b, c) _ _ body) =
+            Left (printf "guess_request failed: server informs: %d%d%d other error" a b c)
+
 
 
 

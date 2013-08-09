@@ -57,10 +57,15 @@ reading_tests = TestList [ test_problem_read1, test_problem_read2
 test_write_guess1 =
     let input = Guess "afa696afglajf696af" (Lambda "x" (Op2 Plus (Id "x") (Literal 1)))
         result = "{\"program\":\"(lambda (x) (plus x 1))\",\"id\":\"afa696afglajf696af\"}"
-    in TestCase $ (assertEqual "" result (BS.unpack $ encode input))
+    in TestCase $ (assertEqual "write_guess1" result (BS.unpack $ encode input))
+
+test_write_eval_request1 =
+    let input = EvalProgram (Lambda "x" (Op1 Shl (Id "x"))) [0x00000000000001, 0xEFFFFFFFFFFFFF]
+        result = "{\"program\":\"(lambda (x) (shl1 x))\",\"arguments\":[\"0x1\",\"0xefffffffffffff\"]}"
+    in TestCase $ (assertEqual "write_eval_request1" esult (BS.unpack $ encode input))
 
 writing_tests :: Test
-writing_tests = TestList [test_write_guess1]
+writing_tests = TestList [test_write_guess1, test_write_eval_request1]
 
 -- [
 --      {"id":"dKdeIAoZMyb5y3a74iTcLXyr",

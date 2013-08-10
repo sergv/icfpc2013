@@ -68,6 +68,9 @@ curlPost path content = do
                -- , CurlHttpPost [body]
                , CurlPostFields [content]
                , CurlWriteFunction $ gatherOutput responseStore
+               -- , CurlWriteFunction $ easyWriter (\s -> do
+               --     printf "curl: got output chunk %s\n" s
+               --     modifyIORef responseStore (++ [s]))
                , CurlHeaderFunction ignoreOutput
                , CurlFailOnError True
                ]
@@ -75,7 +78,7 @@ curlPost path content = do
     perform handle
     code <- {-fmap toCode $-} getResponseCode handle
     output <- readIORef responseStore
-    return (code, Prelude.foldr (++) [] output)
+    return (code, Prelude.foldr (++) [] $ Prelude.reverse output)
 
 request :: (Show a, FromJSON a) => URLString -> String -> (Int -> String) -> IO (Either String a)
 request path content err_func = do
@@ -338,6 +341,7 @@ instance FromJSON Problem where
         (v .: "operators") <*>
         (v .:? "solved") <*>
         (v .:? "timeLeft")
+    parseJSON invalid = error $ "invalid json when reading Problem: " ++ show invalid
 
 ---- Get problems request
 
@@ -395,7 +399,7 @@ eval (Op2 Plus arg1 arg2) env      = (eval arg1 env) + (eval arg2 env)
 
 ---- eval request
 
-data EvalRequest = EvalId (Maybe Id) [Word64]
+data EvalRequest = EvalId Id [Word64]
                  | EvalProgram Program [Word64]
                  deriving (Eq, Show)
 
@@ -420,6 +424,7 @@ instance FromJSON EvalResponse where
             Just "ok"    -> EvalOk <$> liftM (Prelude.map read_hex) (v .: "outputs")
             Just "error" -> EvalError <$> (v .: "message")
             _            -> error $ "invalid status of json eval response" ++ (show v)
+    parseJSON invalid = error $ "invalid json when reading EvalResponse" ++ (show invalid)
 
 eval_request :: EvalRequest -> IO (Either String EvalResponse)
 eval_request req = request "eval" (BS.unpack $ encode req) analyze_error
@@ -478,6 +483,7 @@ instance FromJSON GuessResponse where
                         error $ "invalid values field of GuessResponse: " ++ show invalid
             Just "error"    -> GuessError <$> (v .: "message")
             _               -> error $ "invalid status of json eval response" ++ (show v)
+    parseJSON invalid = error $ "invalid json when reading GuessResponse" ++ (show invalid)
 
 guess_request :: GuessRequest -> IO (Either String GuessResponse)
 guess_request req = request "guess" (BS.unpack $ encode req) analyze_error
@@ -522,6 +528,16 @@ instance ToJSON TrainingRequest where
 --         EvalRequest <$> (v .:? "id") <$> (v .:? "program") <$> (v .: "arguments")
 
 
+-- problem1 = (TrainingProblem
+--          { trainingChallenge = Lambda "x_7987" (Fold (Id "x_7987") (Literal 0) "x_7987" "x_7988" (Op2 Or (Op2 Plus (Literal 1) (Id "x_7988")) (Id "x_7987")))
+--          , trainingId = "koc0i0CB42k6WnlWLoCst5Bo"
+--          , trainingSize = 10
+--          , trainingOperators = [HintOp2 Or, HintOp2 Plus, HintTFold]})
+--
+-- problem1Inputs = [0..255]
+-- problem1Res = Prelude.map (evaluate (trainingChallenge problem1)) inputs
+
+
            -- challenge id size operatros
 data TrainingProblem = TrainingProblem
                      { trainingChallenge :: Program
@@ -538,6 +554,7 @@ instance FromJSON TrainingProblem where
         (v .: "id") <*>
         (v .: "size") <*>
         (v .: "operators")
+    parseJSON invalid = error $ "invalid json when reading TrainingProblem: " ++ show invalid
 
 training_request :: TrainingRequest -> IO (Either String TrainingProblem)
 training_request req = do
@@ -554,8 +571,85 @@ training_request req = do
         analyze_error x =
             (printf "guess_request failed: server informs: %d other error" x)
 
+----- program enumeration
+
+pairs_summing_to :: Int -> [(Int, Int)]
+pairs_summing_to n = [ (i, n - i) | i <- [1..n-1] ]
+
+triples_summing_to :: Int -> [(Int, Int, Int)]
+triples_summing_to n = [ (i, j, n - i - j) | i <- [1 .. n - 2], j <- [1 .. n - i - 1] ]
+
+enumerate_programs :: Int -> [Program]
+enumerate_programs n | n < 3 = []
+                     | otherwise =
+    let top_id = "x"
+        m      = n - 1
+    in Prelude.map (Lambda top_id) $ enumerate_expressions True [top_id] m
+    where
+        enumerate_expressions _ _   0 = []
+        enumerate_expressions _ ids 1 = [Literal 0, Literal 1] ++ Prelude.map Id ids
+        enumerate_expressions _ ids n@2 =
+            [Op1 op arg | arg <- enumerate_expressions False ids (n - 1),
+                          op <- [Not, Shl, Shr, Shr4, Shr16]]
+        enumerate_expressions _ ids n@3 =
+            [Op1 op arg | arg <- enumerate_expressions False ids (n - 1),
+                          op <- [Not, Shl, Shr, Shr4, Shr16]] ++
+            [Op2 op arg1 arg2 | (i, j) <- pairs_summing_to (n - 1),
+                                arg1   <- enumerate_expressions False ids i,
+                                arg2   <- enumerate_expressions False ids j,
+                                op     <- [And, Or, Xor, Plus]]
+        enumerate_expressions _ ids n@4 =
+            [Op1 op arg | arg <- enumerate_expressions False ids (n - 1),
+                          op <- [Not, Shl, Shr, Shr4, Shr16]] ++
+            [Op2 op arg1 arg2 | (i, j) <- pairs_summing_to (n - 1),
+                                arg1   <- enumerate_expressions False ids i,
+                                arg2   <- enumerate_expressions False ids j,
+                                op     <- [And, Or, Xor, Plus]] ++
+            [If0 c t e | (i, j, k) <- triples_summing_to (n - 1),
+                         c <- enumerate_expressions False ids i,
+                         t <- enumerate_expressions False ids j,
+                         e <- enumerate_expressions False ids k]
+        enumerate_expressions use_fold ids n =
+            [Op1 op arg | arg <- enumerate_expressions True ids (n - 1),
+                          op <- [Not, Shl, Shr, Shr4, Shr16]] ++
+            [Op2 op arg1 arg2 | (i, j) <- pairs_summing_to (n - 1),
+                                arg1   <- enumerate_expressions True ids i,
+                                arg2   <- enumerate_expressions True ids j,
+                                op     <- [And, Or, Xor, Plus]] ++
+            [If0 c t e | (i, j, k) <- triples_summing_to (n - 1),
+                         c <- enumerate_expressions True ids i,
+                         t <- enumerate_expressions True ids j,
+                         e <- enumerate_expressions True ids k] ++
+            if use_fold
+            then
+                let aux1 = "aux1"
+                    aux2 = "aux2"
+                in [ Fold e1 e2 aux1 aux2 e3 |
+                     (i, j, k) <- triples_summing_to (n - 2),
+                     e1 <- enumerate_expressions False ids i,
+                     e2 <- enumerate_expressions False ids j,
+                     e3 <- enumerate_expressions False (aux1: aux2: ids) k]
+            else
+                []
+
+orbital :: Program -> Word64 -> Int
+orbital prog input = iter 0 ev1 (eval ev1)
+    where
+        eval x = evaluate prog x
+
+        ev1 = (eval input)
+        iter n slow fast | slow == fast = n
+                         | n >= 10000   = -1
+                         | otherwise    = iter (n + 1) (eval slow) (eval (eval fast))
+
 
 main :: IO ()
 main = do
-     training_request (TrainingRequest 3 RequestNoOperator) >>= print
+     mapM_ (\(p, orb) -> putStrLn (encodeSexp p) >> printf "orbital = %d\n" orb) $
+         sortBy (\(_, orb1) (_, orb2) -> compare orb1 orb2) $
+         Prelude.filter (\(_, orb) -> orb /= 0) $
+         Prelude.map (\p -> (p, orbital p 1)) $
+         enumerate_programs 9
+
+     -- training_request (TrainingRequest 3 RequestNoOperator) >>= print
 

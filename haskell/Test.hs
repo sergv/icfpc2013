@@ -22,7 +22,7 @@ import Data.Aeson (encode, decode, decode')
 import qualified Data.ByteString.Lazy.Char8 as BS
 import qualified Data.ByteString.Char8 as SBS
 
-import Data.HashMap.Strict as HM
+import qualified Data.HashMap.Strict as HM
 
 
 ----- Reading/writing I/O
@@ -37,14 +37,14 @@ test_problem_read1 =
                 , HintOp2 Plus
                 , HintOp1 Not
                 , HintFold ]
-        result = Just $ Problem "dKdeIAoZMyb5y3a74iTcLXyr" 30 hints Nothing Nothing
+        result = Just $ RealProblem "dKdeIAoZMyb5y3a74iTcLXyr" 30 hints Nothing Nothing
     in TestCase $ (assertEqual "" result (decode' input))
 
 test_problem_read2 =
     let input = BS.pack "{\"id\":\"hx2XLtS756IvDv9ZNuILizxJ\", \"size\":3, \"operators\":[\"not\"], \"solved\":true, \"timeLeft\":0}"
 
         hints = [HintOp1 Not]
-        result = Just $ Problem "hx2XLtS756IvDv9ZNuILizxJ" 3 hints (Just True) (Just 0)
+        result = Just $ RealProblem "hx2XLtS756IvDv9ZNuILizxJ" 3 hints (Just True) (Just 0)
     in TestCase $ (assertEqual "" result (decode' input))
 
 reading_tests :: Test
@@ -55,7 +55,7 @@ reading_tests = TestList [ test_problem_read1, test_problem_read2
 ---- writing
 
 test_write_guess1 =
-    let input = Guess "afa696afglajf696af" (Lambda "x" (Op2 Plus (Id "x") (Literal 1)))
+    let input = GuessRequest "afa696afglajf696af" (Lambda "x" (Op2 Plus (Id "x") (Literal 1)))
         result = "{\"program\":\"(lambda (x) (plus x 1))\",\"id\":\"afa696afglajf696af\"}"
     in TestCase $ (assertEqual "write_guess1" result (BS.unpack $ encode input))
 
@@ -204,6 +204,25 @@ util_tests =
                [TestCase $ assertEqual "" res (args_to_hex input) | (res, input) <- args_to_hex_tests]
 
 
+----- enumeration tests
+
+make_test_enumerate1 n =
+    TestCase $ assertBool "" (all (\p -> program_size p <= n) $ enumerate_programs n)
+make_test_enumerate2 n =
+    let problems = hinted_enum n [HintIf0, HintFold]
+    in TestCase $ assertBool "" (all (\p -> program_size p <= n) problems)
+make_test_enumerate3 n =
+    let problems = hinted_enum n [HintIf0, HintTFold]
+    in TestCase $ assertBool "" (all (\p -> program_size p <= n) problems)
+
+enumeration_tests :: Test
+enumeration_tests = TestList $
+    [make_test_enumerate1 n | n <- [2..5]] ++
+    [make_test_enumerate2 n | n <- [3..6]] ++
+    [make_test_enumerate3 n | n <- [3..6]]
+
+
+
 
 ----- main
 
@@ -215,6 +234,7 @@ main = do
     runTestTT sexp_to_program_reading_tests
     runTestTT eval_tests
     runTestTT util_tests
+    runTestTT enumeration_tests
     return ()
 
 

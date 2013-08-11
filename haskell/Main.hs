@@ -50,8 +50,11 @@ import Numeric (showHex, readHex)
 import System.Exit
 import System.Random
 import Text.Printf
+import System.Environment (getArgs)
 import System.IO.Strict (readFile)
 import System.IO.Unsafe (unsafePerformIO)
+import System.Mem
+import System.Timeout
 
 import Debug.Trace (trace)
 import Prelude hiding (readFile)
@@ -110,6 +113,7 @@ request path content err_func = do
     let time_diff = (floor $ diffUTCTime time prev_time) :: Int
     if (time_diff < requestDelay)
     then do
+        performGC
         threadDelay ((requestDelay - time_diff) * 1000000)
         new_time <- getCurrentTime
         res <- do_request
@@ -460,8 +464,10 @@ eval (Fold e1 e2 byte_var accum_var body_expr) env =
 
         upd_env byte acc old_env =
             HM.insert byte_var byte $ HM.insert accum_var acc $ old_env
+        {-# INLINE upd_env #-}
         byte n =
             shiftR main_num (n * 8) .&. 0x00000000000000FF
+        {-# INLINE byte #-}
 
         iter 8 acc env = acc
         iter n acc old_env =
@@ -469,6 +475,7 @@ eval (Fold e1 e2 byte_var accum_var body_expr) env =
                 env = upd_env b acc old_env
                 new_acc = eval body_expr env
             in iter (n + 1) new_acc env
+        {-# INLINE iter #-}
     in  iter 0 init_acc env
 
 eval (Op1 Not arg) env             = complement $ eval arg env
@@ -807,115 +814,233 @@ orbital prog input = iter 0 ev1 (eval ev1)
                          | n >= 10000   = -1
                          | otherwise    = iter (n + 1) (eval slow) (eval (eval fast))
 
+data Context = ContextOp1 Op1
+             | ContextOp2 Op2
+             | ContextIf0Cond
+             | ContextIf0
+             | ContextFold
+             | ContextFoldBody
+             | ContextTFold
+             | ContextToplevel
+             deriving (Eq, Read, Show)
+
+
+interleave :: [a] -> [a] -> [a]
+interleave []     ys     = ys
+interleave xs     []     = xs
+interleave (x:xs) (y:ys) = x:y:interleave xs ys
+{-# INLINE interleave #-}
+
+interleave3 :: [a] -> [a] -> [a] -> [a]
+interleave3 []     ys     zs     = interleave ys zs
+interleave3 xs     []     zs     = interleave xs zs
+interleave3 xs     ys     []     = interleave xs ys
+interleave3 (x:xs) (y:ys) (z:zs) = x:y:z:interleave3 xs ys zs
+{-# INLINE interleave3 #-}
+
+interleave4 :: [a] -> [a] -> [a] -> [a] -> [a]
+interleave4 []     ys     zs     us     = interleave3 ys zs us
+interleave4 xs     []     zs     us     = interleave3 xs zs us
+interleave4 xs     ys     []     us     = interleave3 xs ys us
+interleave4 xs     ys     zs     []     = interleave3 xs ys zs
+interleave4 (x:xs) (y:ys) (z:zs) (u:us) = x:y:z:u:interleave4 xs ys zs us
+{-# INLINE interleave4 #-}
+
+concat4 :: [a] -> [a] -> [a] -> [a] -> [a]
+concat4 xs ys zs us = xs ++ ys ++ zs ++ us
+{-# INLINE concat4 #-}
+
+interleave5 :: [a] -> [a] -> [a] -> [a] -> [a] -> [a]
+interleave5 []     ys     zs     us     ts     = interleave4 ys zs us ts
+interleave5 xs     []     zs     us     ts     = interleave4 xs zs us ts
+interleave5 xs     ys     []     us     ts     = interleave4 xs ys us ts
+interleave5 xs     ys     zs     []     ts     = interleave4 xs ys zs ts
+interleave5 xs     ys     zs     us     []     = interleave4 xs ys zs us
+interleave5 (x:xs) (y:ys) (z:zs) (u:us) (t:ts) = x:y:z:u:t:interleave5 xs ys zs us ts
+{-# INLINE interleave5 #-}
+
+-- split into (head, init) pairs
+splits :: [a] -> [(a, [a])]
+splits []     = []
+splits (x:xs) = (x, xs): splits xs
+{-# INLINE splits #-}
+
 hinted_enum :: Int -> [HintOp] -> [Program]
 hinted_enum n hints =
     let top_id = "x"
         m      = n - 1
-    in Prelude.map (Lambda top_id) $ hinted_enum_expr [top_id] m
+    in Prelude.map (Lambda top_id) $ hinted_enum_expr [Id top_id] m
     where
         fold_arg1 = "aux1"
         fold_arg2 = "aux2"
 
         op1s :: [Op1]
-        op1s     = map (\ (HintOp1 op) -> op) $ filter hint_is_op1 hints
+        op1s = map (\ (HintOp1 op) -> op) $ filter hint_is_op1 hints
+
+        contains_not :: Bool
+        contains_not = Prelude.elem Not op1s
+
         op1s_without_not :: [Op1]
         op1s_without_not = op1s L.\\ [Not]
+
         op2s :: [Op2]
-        op2s     = map (\ (HintOp2 op) -> op) $ filter hint_is_op2 hints
-        has_if, has_fold, is_tfold :: Bool
-        has_if   = elem HintIf0 hints
+        op2s = map (\ (HintOp2 op) -> op) $ filter hint_is_op2 hints
+
+        has_fold, is_tfold :: Bool
         has_fold = elem HintFold hints
         is_tfold = elem HintTFold hints
 
-        hinted_enum_expr :: [Id] -> Int -> [Expression]
+        hinted_enum_expr :: [Expression] -> Int -> [Expression]
         hinted_enum_expr ids n =
             if is_tfold
             then enum_tfold_expr ids n
             else if has_fold
-                then enum_complex_expr ids n HintBonus -- use bonus as no hint
-                else enum_simple_expr ids n HintBonus -- use bonus as no hint
+                then enum_complex_expr ids n ContextToplevel
+                else enum_simple_expr ids n ContextToplevel
 
-        enum_tfold_expr :: [Id] -> Int -> [Expression]
+        enum_tfold_expr :: [Expression] -> Int -> [Expression]
         enum_tfold_expr ids n
             | n < 5     = []
             | otherwise =
-                [ Fold (Id top_id) (Literal 0) top_id fold_arg1 body
-                | top_id <- ids
-                , body   <- enum_simple_expr (fold_arg1: ids) (n - 4) HintTFold
+                [ Fold top_id (Literal 0) name fold_arg1 body
+                | top_id@(Id name) <- ids
+                , body             <- enum_simple_expr (Id fold_arg1: ids) (n - 4) ContextTFold
                 ]
 
-        enum_complex_expr :: [Id] -> Int -> HintOp -> [Expression]
-        enum_complex_expr ids n hint
-            | n < 5     = enum_simple_expr ids n hint
+        enum_complex_expr :: [Expression] -> Int -> Context -> [Expression]
+        enum_complex_expr ids n context
+            | n < 5     = enum_simple_expr ids n context
             | otherwise =
-                make_exprs_general ids n HintBonus enum_complex_expr ++
-                [ Fold e1 e2 fold_arg1 fold_arg2 e3
-                | (i, j, k) <- triples_summing_to (n - 2)
-                , e1        <- enum_simple_expr ids i HintFold
-                , e2        <- enum_simple_expr ids j HintFold
-                , e3        <- enum_simple_expr (fold_arg1: fold_arg2: ids) k HintFold
-                ]
+                interleave
+                    (make_exprs_general ids n ContextToplevel enum_complex_expr)
+                    ([ Fold e1 e2 fold_arg1 fold_arg2 e3
+                     | (i, j, k) <- triples_summing_to (n - 2)
+                     , e1        <- enum_simple_expr ids i ContextFold
+                     , e2        <- enum_simple_expr ids j ContextFold
+                     , e3        <- enum_simple_expr (Id fold_arg1: Id fold_arg2: ids) k ContextFoldBody
+                     ])
 
-        enum_simple_expr :: [Id] -> Int -> HintOp -> [Expression]
-        enum_simple_expr ids 0 _ = []
-        enum_simple_expr ids 1 (HintOp1 Not)   = Prelude.map Id ids
-        enum_simple_expr ids 1 (HintOp1 Shl)   = [Literal 1] ++ Prelude.map Id ids
-        enum_simple_expr ids 1 (HintOp1 Shr)   = [Literal 1] ++ Prelude.map Id ids
-        enum_simple_expr ids 1 (HintOp1 Shr4)  = [Literal 1] ++ Prelude.map Id ids
-        enum_simple_expr ids 1 (HintOp1 Shr16) = [Literal 1] ++ Prelude.map Id ids
-        enum_simple_expr ids 1 (HintOp2 And)   = [Literal 1] ++ Prelude.map Id ids
-        enum_simple_expr ids 1 (HintOp2 Or)    = [Literal 1] ++ Prelude.map Id ids
-        enum_simple_expr ids 1 (HintOp2 Xor)   = [Literal 1] ++ Prelude.map Id ids
-        enum_simple_expr ids 1 (HintOp2 Plus)  = [Literal 1] ++ Prelude.map Id ids
-        enum_simple_expr ids 1 HintIf0         = Prelude.map Id ids
-        enum_simple_expr ids 1 _               = [Literal 0, Literal 1] ++ Prelude.map Id ids
-        enum_simple_expr ids n hint            = make_exprs_general ids n hint enum_simple_expr
+        enum_simple_expr :: [Expression] -> Int -> Context -> [Expression]
+        enum_simple_expr ids 0 _                  = []
+        enum_simple_expr ids 1 (ContextOp1 _)     = Literal 1: ids
+        -- enum_simple_expr ids 1 (ContextOp1 Shl)   = [Literal 1] ++ Prelude.map Id ids
+        -- enum_simple_expr ids 1 (ContextOp1 Shr)   = [Literal 1] ++ Prelude.map Id ids
+        -- enum_simple_expr ids 1 (ContextOp1 Shr4)  = [Literal 1] ++ Prelude.map Id ids
+        -- enum_simple_expr ids 1 (ContextOp1 Shr16) = [Literal 1] ++ Prelude.map Id ids
+        enum_simple_expr ids 1 (ContextOp2 _)     = Literal 1: ids
+        -- enum_simple_expr ids 1 (ContextOp2 And)   = [Literal 1] ++ Prelude.map Id ids
+        -- enum_simple_expr ids 1 (ContextOp2 Or)    = [Literal 1] ++ Prelude.map Id ids
+        -- enum_simple_expr ids 1 (ContextOp2 Xor)   = [Literal 1] ++ Prelude.map Id ids
+        -- enum_simple_expr ids 1 (ContextOp2 Plus)  = [Literal 1] ++ Prelude.map Id ids
+        enum_simple_expr ids 1 ContextIf0Cond     = ids
+        enum_simple_expr ids 1 ContextFoldBody    = ids
+        enum_simple_expr ids 1 _                  = Literal 0: Literal 1: ids
+        enum_simple_expr ids 2 context            =
+            enum_simple_expr ids 1 context ++
+            [ Op1 op arg
+            | op <- op1s
+            , arg <- enum_simple_expr ids 1 (ContextOp1 op)
+            ]
+        enum_simple_expr ids 3 context            =
+            -- this enum_simple_expr will provide literals and Ids
+            enum_simple_expr ids 2 context ++
+            [ Op1 op arg
+            | op <- op1s_without_not
+            , arg <- enum_simple_expr ids 2 (ContextOp1 op)
+            ] ++
+            (if contains_not
+             then [ Op1 Not (Op1 op arg)
+                  | op <- op1s_without_not
+                  , arg <- enum_simple_expr ids 1 (ContextOp1 op)
+                  ]
+             else []) ++
+            (let args = enum_simple_expr ids 1 (ContextOp2 (error "do not dereference this"))
+             in [ Op2 op arg1 arg2
+                | op           <- op2s
+                , (arg1, args) <- splits args
+                , arg2         <- args
+                ])
+        enum_simple_expr ids 4 context            =
+            -- this enum_simple_expr will provide literals and Ids
+            enum_simple_expr ids 3 context ++
+            [ Op1 op arg
+            | op <- op1s_without_not
+            , arg <- enum_simple_expr ids 3 (ContextOp1 op)
+            ] ++
+            (if contains_not
+             then [ Op1 Not (Op1 op1 (Op1 op2 arg))
+                  | op1 <- op1s_without_not
+                  , op2 <- op1s_without_not
+                  , arg <- enum_simple_expr ids 1 (ContextOp1 op2)
+                  ]
+             else []) ++
+            (let is_size1 (Literal _) = True
+                 is_size1 (Id _)      = True
+                 is_size1 _           = False
 
-        make_exprs_general :: [Id] -> Int -> HintOp -> ([Id] -> Int -> HintOp -> [Expression]) -> [Expression]
-        make_exprs_general ids n hint make_subexps =
-            make_exprs ids n hint op1s op2s make_subexps
+                 args = enum_simple_expr ids 2 (ContextOp2 (error "do not dereference this"))
+                 (args_left, args_right) = L.partition is_size1 $ args
+             in [ Op2 op arg1 arg2
+                | op            <- op2s
+                , (arg1, rargs) <- splits args_left
+                , arg2          <- rargs
+                ] ++
+                [ Op2 op arg1 arg2
+                | op   <- op2s
+                , arg1 <- args_left
+                , arg2 <- args_right
+                ])
 
-        make_exprs :: [Id] -> Int -> HintOp -> [Op1] -> [Op2] -> ([Id] -> Int -> HintOp -> [Expression]) -> [Expression]
-        make_exprs ids n hint op1_set op2_set make_subexps = iter 1
+        enum_simple_expr ids n context            = make_exprs_general ids n context enum_simple_expr
+        {-# INLINE enum_simple_expr #-}
+
+        make_exprs_general :: [Expression] -> Int -> Context -> ([Expression] -> Int -> Context -> [Expression]) -> [Expression]
+        make_exprs_general ids n context make_subexps =
+            make_exprs ids n context op1s False make_subexps
+
+        make_exprs :: [Expression] -> Int -> Context -> [Op1] -> Bool -> ([Expression] -> Int -> Context -> [Expression]) -> [Expression]
+        make_exprs ids n context op1_set exact make_subexps = iter 1
             where
                 iter m | m > n     = []
+                       | m <= 4    = interleave (enum_simple_expr ids m context) (iter (m + 1))
                        | otherwise =
-                           enum_simple_expr ids 1 hint ++
-                           [ Op1 op arg
-                           | op  <- op1_set
-                           , arg <- make_subexps ids (m - 1) (HintOp1 op)
-                           ] ++
-                           [ Op2 op arg1 arg2
-                           | (i, j) <- pairs_summing_to (m - 1)
-                           , op     <- op2_set
-                           , arg1   <- make_subexps ids i (HintOp2 op)
-                           , arg2   <- make_subexps ids j (HintOp2 op)
-                           ] ++
-                           [ If0 c t e
-                           | (i, j, k) <- triples_summing_to (m - 1)
-                           , c <- make_if_condition ids i --make_subexps ids i HintIf0
-                           , t <- make_subexps ids j HintIf0
-                           , e <- make_subexps ids k HintIf0
-                           ] ++
-                           iter (m + 1)
+                           (if is_tfold || has_fold then interleave4 else concat4)
+                               ([ Op1 op arg
+                                | op  <- op1_set
+                                , arg <- make_subexps ids (m - 1) (ContextOp1 op)
+                                ])
+                               ([ Op2 op arg1 arg2
+                                | (i, j) <- pairs_summing_to (m - 1)
+                                , op     <- op2s
+                                , arg1   <- make_subexps ids i (ContextOp2 op)
+                                , arg2   <- make_subexps ids j (ContextOp2 op)
+                                ])
+                               ([ If0 c t e
+                                | (i, j, k) <- triples_summing_to (m - 1)
+                                , c <- make_if_condition ids i --make_subexps ids i HintIf0
+                                , t <- make_subexps ids j ContextIf0
+                                , e <- make_subexps ids k ContextIf0
+                               ])
+                               (iter (m + 1))
 
-        make_if_condition :: [Id] -> Int -> [Expression]
-        make_if_condition ids 1 = Prelude.map Id ids -- no sense to make literals here
+        make_if_condition :: [Expression] -> Int -> [Expression]
+        make_if_condition ids 1 = ids -- no sense to make literals here
         make_if_condition ids n =
-            make_exprs ids n HintIf0 op1s_without_not op2s enum_simple_expr
+            make_exprs ids n ContextIf0Cond op1s_without_not False enum_simple_expr
+
 
 -- returns false if this expression can never yield such output
 -- input is omitted deliberately
 check_toplevel_expr_consistency_fast :: Expression -> Word64 -> Bool
-check_toplevel_expr_consistency_fast (Op1 Shl _)         output = not $ testBit output 0
-check_toplevel_expr_consistency_fast (Op1 Shr _)         output = not $ testBit output 63
-check_toplevel_expr_consistency_fast (Op1 Shr4 _)        output = output .&. 0xf000000000000000 == 0x0000000000000000
-check_toplevel_expr_consistency_fast (Op1 Shr16 _)       output = output .&. 0xffff000000000000 == 0x0000000000000000
+check_toplevel_expr_consistency_fast (Op1 Shl _)             output = not $ testBit output 0
+check_toplevel_expr_consistency_fast (Op1 Shr _)             output = not $ testBit output 63
+check_toplevel_expr_consistency_fast (Op1 Shr4 _)            output = output .&. 0xf000000000000000 == 0x0000000000000000
+check_toplevel_expr_consistency_fast (Op1 Shr16 _)           output = output .&. 0xffff000000000000 == 0x0000000000000000
 check_toplevel_expr_consistency_fast (Op1 Not (Op1 Shl _))   output = testBit output 0
 check_toplevel_expr_consistency_fast (Op1 Not (Op1 Shr _))   output = testBit output 63
 check_toplevel_expr_consistency_fast (Op1 Not (Op1 Shr4 _))  output = output .&. 0xf000000000000000 == 0xf000000000000000
 check_toplevel_expr_consistency_fast (Op1 Not (Op1 Shr16 _)) output = output .&. 0xffff000000000000 == 0xffff000000000000
-check_toplevel_expr_consistency_fast _             _      = True
+check_toplevel_expr_consistency_fast _                       _      = True
 
 
 enum_problem :: (Problem p) => p -> [Program]
@@ -936,6 +1061,7 @@ solve_problem p = do
     case resp of
         Left (412, _) -> do
             add_solved_problem $ problemId p
+            performGC
             return $ Right $ problemId p
         Left (_, msg) -> do
             printf "error while doing initial eval request: %s\n" msg
@@ -952,6 +1078,8 @@ solve_problem p = do
             all (\(input, output) -> check_toplevel_expr_consistency_fast expr output &&
                     output == evaluate prog input)
                 io_pairs
+
+        {-# inline check_prog #-}
         iter :: [Program] -> [(Word64, Word64)] -> IS.IntSet -> IO (Either String String)
         iter progs io_pairs input_set = do
             let !(candidate_prog: progs_rest) =
@@ -961,10 +1089,13 @@ solve_problem p = do
             case resp of
                 Left (412, _) -> do
                     add_solved_problem $ problemId p
+                    performGC
                     return $ Right $ problemId p
                 Left (_, msg) -> do
                     printf "error while doing guess request: %s\n" msg
-                    iter progs io_pairs input_set
+                    -- do not hold to progs, use (candidate_prog: progs_rest) instead
+                    iter (candidate_prog: progs_rest) io_pairs input_set
+                    return $ Left "error"
                 Right (GuessError msg) -> do
                     printf "error while doing guess request: %s\n" msg
                     return $ Left "error"
@@ -984,6 +1115,7 @@ solve_problem p = do
                     case eval_resp of
                         Left (412, _) -> do
                             add_solved_problem $ problemId p
+                            performGC
                             return $ Right $ problemId p
                         Left (_, msg) -> do
                             printf "error while doing eval request: %s\n" msg
@@ -1025,9 +1157,12 @@ sort_by_complexity problems =
         compare_complexities p1 p2 = compare (complexity p1) (complexity p2)
     in  sortBy compare_complexities problems
 
+enum_problem_show p = mapM_ (putStrLn . encodeSexp) $ enum_problem p
+
 -- these problems caused some problems with non-exhaustive enumeration :)
 -- p1 = RealProblem {realProblemId = "HWSBmwZ3D9cRQXY2dYn4EvDf", realProblemSize = 4, realProblemOperators = [HintOp2 And], realProblemSolved = Nothing, realProblemTimeLeft = Nothing}
 -- p2 = RealProblem {realProblemId = "hwl8sozz7vR4Syyhpg7fmQPS", realProblemSize = 9, realProblemOperators = [HintIf0,HintOp1 Not,HintOp2 Or], realProblemSolved = Nothing, realProblemTimeLeft = Nothing}
+
 
 main :: IO ()
 main = do
@@ -1037,8 +1172,18 @@ main = do
     --     Prelude.map (\p -> (p, orbital p 1)) $
     --     enumerate_programs 7
 
+    args <- getArgs
+    let do_fold  = L.elem "--fold" args
+        do_tfold = L.elem "--tfold" args
+        do_plain = L.elem "--plain" args
+        do_bonus = L.elem "--bonus" args
+        suitable_ops ops =
+            (do_fold && L.elem HintFold ops ||
+             do_tfold && L.elem HintTFold ops ||
+             do_plain && True) &&
+            if L.elem HintBonus ops then do_bonus else True
 
-    load_problems >>= mapM_ solve . sort_by_complexity
+    load_problems >>= mapM_ (\p -> (timeout (301 * 1000000) $ solve p) >>= handle_timed_out p) . sort_by_complexity . filter (\p -> not $ L.elem HintFold $ problemOperators p)
 
     -- let problem = problem12
     -- printf "size = %d, # of operators = %d\n" (problemSize problem) (length $ problemOperators problem)
@@ -1057,10 +1202,25 @@ main = do
 
     -- training_request (TrainingRequest 3 RequestNoOperator) >>= print
     where
+        handle_timed_out problem Nothing = do
+            printf "hit timeout\n"
+            add_solved_problem $ problemId problem
+        handle_timed_out problem _       = return ()
+
+        is_fold, is_tfold :: (Problem p) => p -> Bool
+        is_fold p = L.elem HintFold $ problemOperators p
+        is_tfold p = L.elem HintTFold $ problemOperators p
+
         solve :: (Problem p) => p -> IO ()
         solve problem = do
-            printf "id = %s, size = %d, # of operators = %d\n" (problemId problem) (problemSize problem) (length $ problemOperators problem)
+            printf "id = %s, size = %d, # of operators = %d, %s\n"
+                (problemId problem)
+                (problemSize problem)
+                (length $ problemOperators problem)
+                ((if is_fold problem then "fold" else
+                     (if is_tfold problem then "tfold" else "plain")) :: String)
             start <- getCurrentTime
+            printf "time = %s\n" (show start)
             res <- solve_problem problem
             end <- getCurrentTime
             case res of
@@ -1068,7 +1228,10 @@ main = do
                 Right id -> do
                     add_solved_problem id
                     printf "duration = %s\n" (show $ diffUTCTime end start)
-                    exitWith ExitSuccess
+                    -- printf "now you can stop\n"
+                    -- threadDelay 1000000
+                    performGC
+                    -- exitWith ExitSuccess
                     return ()
 
 

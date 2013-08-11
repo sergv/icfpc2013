@@ -31,9 +31,11 @@ import qualified Data.ByteString.Lazy.Char8 as BS
 import qualified Data.ByteString.Char8 as SBS
 import Data.Functor (fmap)
 import qualified Data.HashMap.Strict as HM
+import qualified Data.HashSet as HS
 import qualified Data.IntMap as IM
 import qualified Data.IntSet as IS
 import Data.IORef
+import qualified Data.List as L
 import Data.List (sortBy)
 import Data.Ord (compare)
 import Data.Time
@@ -45,11 +47,14 @@ import Data.Word
 import Network.Curl hiding (curlPost)
 
 import Numeric (showHex, readHex)
+import System.Exit
 import System.Random
 import Text.Printf
+import System.IO.Strict (readFile)
 import System.IO.Unsafe (unsafePerformIO)
 
 import Debug.Trace (trace)
+import Prelude hiding (readFile)
 
 eitherDecode, eitherDecode' :: (Show a, FromJSON a) => BS.ByteString -> Either String a
 eitherDecode input = maybe (Left $ "decoding failed for " ++ BS.unpack input) Right $ decode input
@@ -82,7 +87,7 @@ curlPost path content = do
                --     printf "curl: got output chunk %s\n" s
                --     modifyIORef responseStore (++ [s]))
                , CurlHeaderFunction ignoreOutput
-               , CurlFailOnError True
+               -- , CurlFailOnError True
                ]
     mapM_ (setopt handle) opts
     perform handle
@@ -98,7 +103,7 @@ prevRequestTime :: IORef UTCTime
 prevRequestTime = unsafePerformIO (getCurrentTime >>= newIORef)
 {-# NOINLINE prevRequestTime #-}
 
-request :: (Show a, FromJSON a) => URLString -> String -> (Int -> String) -> IO (Either String a)
+request :: (Show a, FromJSON a) => URLString -> String -> (Int -> (Int, String)) -> IO (Either (Int, String) a)
 request path content err_func = do
     prev_time <- readIORef prevRequestTime
     time <- getCurrentTime
@@ -115,10 +120,13 @@ request path content err_func = do
         writeIORef prevRequestTime time
         return res
     where
+        -- do_request :: IO (Either (Int, String) a)
         do_request = do
             (code, output) <- Main.curlPost path content
             if code == 200
-            then return $ eitherDecode' $ BS.pack output
+            then case eitherDecode' $ BS.pack output of
+                Left err  -> return (Left (-1, err))
+                Right res -> return $ Right res
             else return $ Left $ err_func code
 
     -- setopt handle CurlURL ("http://" ++ url ++ "/" ++ path ++ "?auth=" ++ auth ++ suffix)
@@ -361,10 +369,21 @@ instance Problem RealProblem where
     problemSize      = realProblemSize
     problemOperators = realProblemOperators
 
-problem_store = "/home/sergey/projects/icfpc/2013_Aug/haskell/problems.store"
+problem_store = "/home/sergey/projects/icfpc/2013_Aug/haskell/problems.full"
+solved_problems = "/home/sergey/projects/icfpc/2013_Aug/haskell/problems.solved"
 
 load_problems :: IO [RealProblem]
-load_problems = readFile problem_store >>= return . read
+load_problems = do
+    problems <- fmap read $ readFile problem_store
+    solved <- (fmap read $ readFile solved_problems) :: IO [String]
+    let solved_set = HS.fromList solved
+    return $ filter (\p -> not $ HS.member (realProblemId p) solved_set) problems
+
+add_solved_problem :: String -> IO ()
+add_solved_problem new_id = do
+    solved_ids <- (fmap read $ readFile solved_problems) :: IO [String]
+    writeFile solved_problems (show $ new_id: solved_ids)
+
 
 type MayFailStr = Either String String
 
@@ -412,15 +431,15 @@ instance FromJSON RealProblem where
 
 ---- Get problems request
 
-get_problems :: IO (Either String [RealProblem])
+get_problems :: IO (Either (Int, String) [RealProblem])
 get_problems = request "myproblems" "" analyze_error
     where
         analyze_error 403 =
-            "get_problems failed: server informs: 403 authorization required"
+            (403, "get_problems failed: server informs: 403 authorization required")
         analyze_error 429 =
-            "get_problems failed: server informs: 429 try again later"
+            (429, "get_problems failed: server informs: 429 try again later")
         analyze_error x =
-            (printf "get_problems failed: server informs: %d other error" x)
+            (x, (printf "get_problems failed: server informs: %d other error" x))
 
 
 ----- Evaluation
@@ -493,23 +512,23 @@ instance FromJSON EvalResponse where
             _            -> error $ "invalid status of json eval response" ++ (show v)
     parseJSON invalid = error $ "invalid json when reading EvalResponse" ++ (show invalid)
 
-eval_request :: EvalRequest -> IO (Either String EvalResponse)
+eval_request :: EvalRequest -> IO (Either (Int, String) EvalResponse)
 eval_request req = request "eval" (BS.unpack $ encode req) analyze_error
     where
         analyze_error 400 =
-            "eval_request failed: server informs: 400 bad request, malformed input"
+            (400, "eval_request failed: server informs: 400 bad request, malformed input")
         analyze_error 401 =
-            "eval_request failed: server informs: 401 problem was not requested by the current user"
+            (401, "eval_request failed: server informs: 401 problem was not requested by the current user")
         analyze_error 404 =
-            "eval_request failed: server informs: 404 no such challenge"
+            (404, "eval_request failed: server informs: 404 no such challenge")
         analyze_error 410 =
-            "eval_request failed: server informs: 410 too late: problem requested more than 5 minutes ago"
+            (410, "eval_request failed: server informs: 410 too late: problem requested more than 5 minutes ago")
         analyze_error 412 =
-            "eval_request failed: server informs: 412 problem already solved"
+            (412, "eval_request failed: server informs: 412 problem already solved")
         analyze_error 413 =
-            "eval_request failed: server informs: 413 request too big"
+            (413, "eval_request failed: server informs: 413 request too big")
         analyze_error x =
-            (printf "eval_request failed: server informs: %d other error" x)
+            (x, (printf "eval_request failed: server informs: %d other error" x))
 
 ----- Guesses
 
@@ -552,23 +571,23 @@ instance FromJSON GuessResponse where
             _               -> error $ "invalid status of json eval response" ++ (show v)
     parseJSON invalid = error $ "invalid json when reading GuessResponse" ++ (show invalid)
 
-guess_request :: GuessRequest -> IO (Either String GuessResponse)
+guess_request :: GuessRequest -> IO (Either (Int, String) GuessResponse)
 guess_request req = request "guess" (BS.unpack $ encode req) analyze_error
     where
         analyze_error 400 =
-            "guess_request failed: server informs: 400 bad request, malformed input"
+            (400, "guess_request failed: server informs: 400 bad request, malformed input")
         analyze_error 401 =
-            "guess_request failed: server informs: 401 problem was not requested by the current user"
+            (401, "guess_request failed: server informs: 401 problem was not requested by the current user")
         analyze_error 404 =
-            "guess_request failed: server informs: 404 no such challenge"
+            (404, "guess_request failed: server informs: 404 no such challenge")
         analyze_error 410 =
-            "guess_request failed: server informs: 410 too late: problem requested more than 5 minutes ago"
+            (410, "guess_request failed: server informs: 410 too late: problem requested more than 5 minutes ago")
         analyze_error 412 =
-            "guess_request failed: server informs: 412 problem already solved"
+            (412, "guess_request failed: server informs: 412 problem already solved")
         analyze_error 413 =
-            "guess_request failed: server informs: 413 request too big"
+            (413, "guess_request failed: server informs: 413 request too big")
         analyze_error x =
-            (printf "guess_request failed: server informs: %d other error" x)
+            (x, (printf "guess_request failed: server informs: %d other error" x))
 
 ----- Training
 
@@ -679,25 +698,28 @@ instance FromJSON TrainingProblem where
         (v .: "operators")
     parseJSON invalid = error $ "invalid json when reading TrainingProblem: " ++ show invalid
 
-training_request :: TrainingRequest -> IO (Either String TrainingProblem)
+training_request :: TrainingRequest -> IO (Either (Int, String) TrainingProblem)
 training_request req = do
     let r = (BS.unpack $ encode req)
     printf "r = %s\n" r
     request "train" r analyze_error
     where
         analyze_error 400 =
-            "guess_request failed: server informs: 400 bad request, malformed input"
+            (400, "guess_request failed: server informs: 400 bad request, malformed input")
         analyze_error 403 =
-            "guess_request failed: server informs: 403 authorization required"
+            (403, "guess_request failed: server informs: 403 authorization required")
         analyze_error 429 =
-            "guess_request failed: server informs: 429 try again later"
+            (429, "guess_request failed: server informs: 429 try again later")
         analyze_error x =
-            (printf "guess_request failed: server informs: %d other error" x)
+            (x, (printf "guess_request failed: server informs: %d other error" x))
 
 ----- program enumeration
 
+-- since this is used only for commutative oprerators, it suffices to use only
+-- half of the range
 pairs_summing_to :: Int -> [(Int, Int)]
-pairs_summing_to n = [ (i, n - i) | i <- [1..n-1] ]
+pairs_summing_to n = [ (i, n - i) | i <- [1 .. floor (fromIntegral n / 2) ] ]
+-- pairs_summing_to n = [ (i, n - i) | i <- [1 .. n-1] ]
 
 triples_summing_to :: Int -> [(Int, Int, Int)]
 triples_summing_to n = [ (i, j, n - i - j) | i <- [1 .. n - 2], j <- [1 .. n - i - 1] ]
@@ -794,8 +816,13 @@ hinted_enum n hints =
         fold_arg1 = "aux1"
         fold_arg2 = "aux2"
 
+        op1s :: [Op1]
         op1s     = map (\ (HintOp1 op) -> op) $ filter hint_is_op1 hints
+        op1s_without_not :: [Op1]
+        op1s_without_not = op1s L.\\ [Not]
+        op2s :: [Op2]
         op2s     = map (\ (HintOp2 op) -> op) $ filter hint_is_op2 hints
+        has_if, has_fold, is_tfold :: Bool
         has_if   = elem HintIf0 hints
         has_fold = elem HintFold hints
         is_tfold = elem HintTFold hints
@@ -803,98 +830,119 @@ hinted_enum n hints =
         hinted_enum_expr :: [Id] -> Int -> [Expression]
         hinted_enum_expr ids n =
             if is_tfold
-            then hinted_enum_tfold_expr ids n
+            then enum_tfold_expr ids n
             else if has_fold
-                then hinted_enum_complex_expr ids n HintBonus -- use bonus as no hint
-                else hinted_enum_simple_expr ids n HintBonus -- use bonus as no hint
+                then enum_complex_expr ids n HintBonus -- use bonus as no hint
+                else enum_simple_expr ids n HintBonus -- use bonus as no hint
 
-        hinted_enum_tfold_expr :: [Id] -> Int -> [Expression]
-        hinted_enum_tfold_expr ids n
+        enum_tfold_expr :: [Id] -> Int -> [Expression]
+        enum_tfold_expr ids n
             | n < 5     = []
             | otherwise =
                 [ Fold (Id top_id) (Literal 0) top_id fold_arg1 body
                 | top_id <- ids
-                , body   <- hinted_enum_simple_expr (fold_arg1: ids) (n - 4) HintTFold
+                , body   <- enum_simple_expr (fold_arg1: ids) (n - 4) HintTFold
                 ]
 
-        hinted_enum_complex_expr :: [Id] -> Int -> HintOp -> [Expression]
-        hinted_enum_complex_expr ids n hint
-            | n < 5     = hinted_enum_simple_expr ids n hint
+        enum_complex_expr :: [Id] -> Int -> HintOp -> [Expression]
+        enum_complex_expr ids n hint
+            | n < 5     = enum_simple_expr ids n hint
             | otherwise =
-                make_exprs ids n hinted_enum_complex_expr ++
+                make_exprs_general ids n HintBonus enum_complex_expr ++
                 [ Fold e1 e2 fold_arg1 fold_arg2 e3
                 | (i, j, k) <- triples_summing_to (n - 2)
-                , e1        <- hinted_enum_simple_expr ids i HintFold
-                , e2        <- hinted_enum_simple_expr ids j HintFold
-                , e3        <- hinted_enum_simple_expr (fold_arg1: fold_arg2: ids) k HintFold
+                , e1        <- enum_simple_expr ids i HintFold
+                , e2        <- enum_simple_expr ids j HintFold
+                , e3        <- enum_simple_expr (fold_arg1: fold_arg2: ids) k HintFold
                 ]
 
-        hinted_enum_simple_expr :: [Id] -> Int -> HintOp -> [Expression]
-        hinted_enum_simple_expr ids 0 _ = []
-        hinted_enum_simple_expr ids 1 (HintOp1 Shl)   = [Literal 1] ++ Prelude.map Id ids
-        hinted_enum_simple_expr ids 1 (HintOp1 Shr)   = [Literal 1] ++ Prelude.map Id ids
-        hinted_enum_simple_expr ids 1 (HintOp1 Shr4)  = [Literal 1] ++ Prelude.map Id ids
-        hinted_enum_simple_expr ids 1 (HintOp1 Shr16) = [Literal 1] ++ Prelude.map Id ids
-        hinted_enum_simple_expr ids 1 (HintOp2 And)   = Prelude.map Id ids
-        hinted_enum_simple_expr ids 1 (HintOp2 Or)    = Prelude.map Id ids
-        hinted_enum_simple_expr ids 1 (HintOp2 Xor)   = [Literal 1] ++ Prelude.map Id ids
-        hinted_enum_simple_expr ids 1 (HintOp2 Plus)  = [Literal 1] ++ Prelude.map Id ids
-        hinted_enum_simple_expr ids 1 _ = [Literal 0, Literal 1] ++ Prelude.map Id ids
-        hinted_enum_simple_expr ids n _ = make_exprs ids n hinted_enum_simple_expr
+        enum_simple_expr :: [Id] -> Int -> HintOp -> [Expression]
+        enum_simple_expr ids 0 _ = []
+        enum_simple_expr ids 1 (HintOp1 Not)   = Prelude.map Id ids
+        enum_simple_expr ids 1 (HintOp1 Shl)   = [Literal 1] ++ Prelude.map Id ids
+        enum_simple_expr ids 1 (HintOp1 Shr)   = [Literal 1] ++ Prelude.map Id ids
+        enum_simple_expr ids 1 (HintOp1 Shr4)  = [Literal 1] ++ Prelude.map Id ids
+        enum_simple_expr ids 1 (HintOp1 Shr16) = [Literal 1] ++ Prelude.map Id ids
+        enum_simple_expr ids 1 (HintOp2 And)   = [Literal 1] ++ Prelude.map Id ids
+        enum_simple_expr ids 1 (HintOp2 Or)    = [Literal 1] ++ Prelude.map Id ids
+        enum_simple_expr ids 1 (HintOp2 Xor)   = [Literal 1] ++ Prelude.map Id ids
+        enum_simple_expr ids 1 (HintOp2 Plus)  = [Literal 1] ++ Prelude.map Id ids
+        enum_simple_expr ids 1 HintIf0         = Prelude.map Id ids
+        enum_simple_expr ids 1 _               = [Literal 0, Literal 1] ++ Prelude.map Id ids
+        enum_simple_expr ids n hint            = make_exprs_general ids n hint enum_simple_expr
 
-        make_exprs :: [Id] -> Int -> ([Id] -> Int -> HintOp -> [Expression]) -> [Expression]
-        make_exprs ids n make_subexps = iter 1
+        make_exprs_general :: [Id] -> Int -> HintOp -> ([Id] -> Int -> HintOp -> [Expression]) -> [Expression]
+        make_exprs_general ids n hint make_subexps =
+            make_exprs ids n hint op1s op2s make_subexps
+
+        make_exprs :: [Id] -> Int -> HintOp -> [Op1] -> [Op2] -> ([Id] -> Int -> HintOp -> [Expression]) -> [Expression]
+        make_exprs ids n hint op1_set op2_set make_subexps = iter 1
             where
                 iter m | m > n     = []
                        | otherwise =
-                           [Literal 0, Literal 1] ++ Prelude.map Id ids ++
+                           enum_simple_expr ids 1 hint ++
                            [ Op1 op arg
-                           | op  <- op1s
+                           | op  <- op1_set
                            , arg <- make_subexps ids (m - 1) (HintOp1 op)
                            ] ++
                            [ Op2 op arg1 arg2
                            | (i, j) <- pairs_summing_to (m - 1)
-                           , op     <- op2s
+                           , op     <- op2_set
                            , arg1   <- make_subexps ids i (HintOp2 op)
                            , arg2   <- make_subexps ids j (HintOp2 op)
                            ] ++
                            [ If0 c t e
                            | (i, j, k) <- triples_summing_to (m - 1)
-                           , c <- make_subexps ids i HintIf0
+                           , c <- make_if_condition ids i --make_subexps ids i HintIf0
                            , t <- make_subexps ids j HintIf0
                            , e <- make_subexps ids k HintIf0
                            ] ++
                            iter (m + 1)
 
+        make_if_condition :: [Id] -> Int -> [Expression]
+        make_if_condition ids 1 = Prelude.map Id ids -- no sense to make literals here
+        make_if_condition ids n =
+            make_exprs ids n HintIf0 op1s_without_not op2s enum_simple_expr
+
 -- returns false if this expression can never yield such output
 -- input is omitted deliberately
 check_toplevel_expr_consistency_fast :: Expression -> Word64 -> Bool
-check_toplevel_expr_consistency_fast (Op1 Shl _)   output = not $ testBit output 0
-check_toplevel_expr_consistency_fast (Op1 Shr _)   output = not $ testBit output 63
-check_toplevel_expr_consistency_fast (Op1 Shr4 _)  output = output .&. 0xf000000000000000 == 0x0000000000000000
-check_toplevel_expr_consistency_fast (Op1 Shr16 _) output = output .&. 0xffff000000000000 == 0x0000000000000000
+check_toplevel_expr_consistency_fast (Op1 Shl _)         output = not $ testBit output 0
+check_toplevel_expr_consistency_fast (Op1 Shr _)         output = not $ testBit output 63
+check_toplevel_expr_consistency_fast (Op1 Shr4 _)        output = output .&. 0xf000000000000000 == 0x0000000000000000
+check_toplevel_expr_consistency_fast (Op1 Shr16 _)       output = output .&. 0xffff000000000000 == 0x0000000000000000
+check_toplevel_expr_consistency_fast (Op1 Not (Op1 Shl _))   output = testBit output 0
+check_toplevel_expr_consistency_fast (Op1 Not (Op1 Shr _))   output = testBit output 63
+check_toplevel_expr_consistency_fast (Op1 Not (Op1 Shr4 _))  output = output .&. 0xf000000000000000 == 0xf000000000000000
+check_toplevel_expr_consistency_fast (Op1 Not (Op1 Shr16 _)) output = output .&. 0xffff000000000000 == 0xffff000000000000
 check_toplevel_expr_consistency_fast _             _      = True
 
 
 enum_problem :: (Problem p) => p -> [Program]
 enum_problem p = hinted_enum (problemSize p) (problemOperators p)
+-- enum_problem p = enumerate_programs (problemSize p)
 
 debug x = putStrLn x
 
 inputs_at_a_time :: Int
 inputs_at_a_time = 256
 
-solve_problem :: (Problem p) => p -> IO ()
+solve_problem :: (Problem p) => p -> IO (Either String String)
 solve_problem p = do
     let progs  = enum_problem p
         inputs = Prelude.take inputs_at_a_time [0..]
     debug "doing initial eval"
     resp <- eval_request $! EvalId (problemId p) inputs
     case resp of
-        Left msg -> do
+        Left (412, _) -> do
+            add_solved_problem $ problemId p
+            return $ Right $ problemId p
+        Left (_, msg) -> do
             printf "error while doing initial eval request: %s\n" msg
+            return $ Left "error"
         Right (EvalError msg) -> do
             printf "eval error while doing initial eval request: %s\n" msg
+            return $ Left "error"
         Right (EvalOk outputs) -> do
             debug "initial eval ok"
             iter progs (zip inputs outputs) (IS.fromList $! map fromIntegral inputs)
@@ -904,20 +952,29 @@ solve_problem p = do
             all (\(input, output) -> check_toplevel_expr_consistency_fast expr output &&
                     output == evaluate prog input)
                 io_pairs
-        iter :: [Program] -> [(Word64, Word64)] -> IS.IntSet -> IO ()
+        iter :: [Program] -> [(Word64, Word64)] -> IS.IntSet -> IO (Either String String)
         iter progs io_pairs input_set = do
             let !(candidate_prog: progs_rest) =
                     filter (\p -> check_prog p io_pairs) progs
             debug $ printf "doing guess with program %s" (encodeSexp candidate_prog)
             resp <- guess_request $! GuessRequest (problemId p) candidate_prog
             case resp of
-                Left msg -> do
+                Left (412, _) -> do
+                    add_solved_problem $ problemId p
+                    return $ Right $ problemId p
+                Left (_, msg) -> do
                     printf "error while doing guess request: %s\n" msg
+                    iter progs io_pairs input_set
                 Right (GuessError msg) -> do
                     printf "error while doing guess request: %s\n" msg
+                    return $ Left "error"
                 Right (GuessWin) -> do
                     printf "guessed correctly: %s\n" (encodeSexp candidate_prog)
+                    return $ Right $ problemId p
                 Right (GuessMismatch new_input res our_res) -> do
+                    do_eval progs_rest new_input res our_res
+            where
+                do_eval progs_rest new_input res our_res = do
                     debug "guess mismatch"
                     -- reps <- eval_request $! EvalId (problemId p) input_set
                     let input_set' = IS.insert (fromIntegral $ read_hex new_input) input_set
@@ -925,10 +982,15 @@ solve_problem p = do
                     debug "doing eval to clarify matters"
                     eval_resp <- eval_request $! EvalId (problemId p) more_inputs
                     case eval_resp of
-                        Left msg -> do
+                        Left (412, _) -> do
+                            add_solved_problem $ problemId p
+                            return $ Right $ problemId p
+                        Left (_, msg) -> do
                             printf "error while doing eval request: %s\n" msg
+                            do_eval progs_rest new_input res our_res
                         Right (EvalError msg) -> do
                             printf "eval error while doing eval request: %s\n" msg
+                            return $ Left "error"
                         Right (EvalOk outputs) -> do
                             debug "iterating further"
                             -- let new_pairs =
@@ -957,6 +1019,16 @@ generateInputs input_set = do
                 then generate n gen' inp generated_inputs
                 else generate (n - 1) gen' (IS.insert sample' inp) (sample: generated_inputs)
 
+
+sort_by_complexity problems =
+    let complexity p = (length (problemOperators p) + problemSize p)
+        compare_complexities p1 p2 = compare (complexity p1) (complexity p2)
+    in  sortBy compare_complexities problems
+
+-- these problems caused some problems with non-exhaustive enumeration :)
+-- p1 = RealProblem {realProblemId = "HWSBmwZ3D9cRQXY2dYn4EvDf", realProblemSize = 4, realProblemOperators = [HintOp2 And], realProblemSolved = Nothing, realProblemTimeLeft = Nothing}
+-- p2 = RealProblem {realProblemId = "hwl8sozz7vR4Syyhpg7fmQPS", realProblemSize = 9, realProblemOperators = [HintIf0,HintOp1 Not,HintOp2 Or], realProblemSolved = Nothing, realProblemTimeLeft = Nothing}
+
 main :: IO ()
 main = do
     -- mapM_ (\(p, orb) -> putStrLn (encodeSexp p) >> printf "orbital = %d\n" orb) $
@@ -965,13 +1037,17 @@ main = do
     --     Prelude.map (\p -> (p, orbital p 1)) $
     --     enumerate_programs 7
 
-    let problem = problem12
-    printf "size = %d, # of operators = %d\n" (problemSize problem) (length $ problemOperators problem)
-    start <- getCurrentTime
-    solve_problem problem
-    end <- getCurrentTime
-    printf "answer = %s\n" (encodeSexp $ trainingChallenge problem)
-    printf "duration = %s\n" (show $ diffUTCTime end start)
+
+    load_problems >>= mapM_ solve . sort_by_complexity
+
+    -- let problem = problem12
+    -- printf "size = %d, # of operators = %d\n" (problemSize problem) (length $ problemOperators problem)
+    -- start <- getCurrentTime
+    -- solve_problem problem
+    -- end <- getCurrentTime
+    -- printf "answer = %s\n" (encodeSexp $ trainingChallenge problem)
+    -- printf "duration = %s\n" (show $ diffUTCTime end start)
+
 
     -- problems <- load_problems
     -- mapM_ (\p -> printf "size = %d, hint length = %d, hint = %s\n" (problemSize p) (length $ problemOperators p) (show $ problemOperators p) >> printf "# of programs = %d\n" (length $ enum_problem p)) $
@@ -980,4 +1056,19 @@ main = do
     --     problems
 
     -- training_request (TrainingRequest 3 RequestNoOperator) >>= print
+    where
+        solve :: (Problem p) => p -> IO ()
+        solve problem = do
+            printf "id = %s, size = %d, # of operators = %d\n" (problemId problem) (problemSize problem) (length $ problemOperators problem)
+            start <- getCurrentTime
+            res <- solve_problem problem
+            end <- getCurrentTime
+            case res of
+                Left msg -> solve problem -- retry
+                Right id -> do
+                    add_solved_problem id
+                    printf "duration = %s\n" (show $ diffUTCTime end start)
+                    exitWith ExitSuccess
+                    return ()
+
 
